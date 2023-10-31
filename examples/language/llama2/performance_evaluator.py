@@ -84,12 +84,23 @@ class PerformanceEvaluator:
         if self.disable:
             return
         torch.cuda.synchronize()
+        step_time = time() - self.timer.start_time
         self.timer.end()
 
         batch_size, seq_len = input_ids.shape
-
         self.num_samples += batch_size
         self.flop += batch_size * seq_len * self.model_numel * 2 * (3 + int(self.enable_grad_checkpoint))
+
+        # print step tflops and throughput
+        flop = batch_size * seq_len * self.model_numel * 2 * (3 + int(self.enable_grad_checkpoint))
+        throughput = batch_size * self.dp_world_size / (step_time + 1e-12)
+
+        mp_world_size = self.coordinator.world_size // self.dp_world_size
+        tflops = flop / 1e12 / (step_time + 1e-12) / mp_world_size
+
+        self.coordinator.print_on_master(
+            f"Step Throughput: {throughput:.2f} samples/sec, Step TFLOPS per GPU: {tflops:.2f}"
+        )
 
     def on_fit_end(self) -> None:
         avg_duration = all_reduce_mean(self.timer.duration, self.coordinator.world_size)

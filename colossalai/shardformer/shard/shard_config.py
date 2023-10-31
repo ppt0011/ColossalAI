@@ -70,7 +70,7 @@ class ShardConfig:
         self.enable_flash_attention = True
         self.enable_jit_fused = True
         self.enable_sequence_parallelism = True
-        self.enable_sequence_overlap = True
+        self.enable_sequence_overlap = False
 
     def _infer(self):
         """

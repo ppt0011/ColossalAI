@@ -1,14 +1,18 @@
 import argparse
+import os
 import resource
 from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 from attn import SUPPORT_FLASH, replace_xformers
 from data_utils import RandomDataset
 from model_utils import format_numel_str, get_model_numel
 from performance_evaluator import PerformanceEvaluator
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, MixedPrecision
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
@@ -25,7 +29,10 @@ from colossalai.utils import get_current_device
 # ==============================
 
 MODEL_CONFIGS = {
-    "7b": LlamaConfig(max_position_embeddings=4096),
+    "7b": LlamaConfig(
+        max_position_embeddings=4096,
+        # num_hidden_layers=2,
+    ),
     "13b": LlamaConfig(
         hidden_size=5120,
         intermediate_size=13824,
@@ -74,6 +81,7 @@ def main():
     parser.add_argument("--pp", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--mbs", type=int, default=1)
     parser.add_argument("--zero", type=int, default=0)
+    parser.add_argument("--tensorboard_dir", type=str, default="logs_dir", help="Tensorboard directory")
     args = parser.parse_args()
 
     colossalai.launch_from_torch({})
@@ -81,6 +89,18 @@ def main():
 
     def empty_init():
         pass
+
+    def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
+        dist.all_reduce(tensor=tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(dist.get_world_size())
+        return tensor
+
+    # ==============================
+    # Initialize Tensorboard
+    # ==============================
+    if coordinator.is_master():
+        os.makedirs(args.tensorboard_dir, exist_ok=True)
+        writer = SummaryWriter(args.tensorboard_dir)
 
     # ==============================
     # Initialize Booster
@@ -130,8 +150,8 @@ def main():
             tp_size=args.tp,
             pp_size=args.pp,
             zero_stage=args.zero,
-            enable_fused_normalization=True,
-            num_microbatches=args.mbs,
+            enable_all_optimization=True,
+            num_microbatches=2,
             precision="bf16",
         )
     elif args.plugin == "3d_cpu":
@@ -170,6 +190,14 @@ def main():
         else nullcontext()
     )
 
+    output_transform_fn = lambda x: x
+    criterion = lambda x: x.loss
+
+    def _criterion(outputs, inputs):
+        outputs = output_transform_fn(outputs)
+        loss = criterion(outputs)
+        return loss
+
     with init_ctx:
         model = LlamaForCausalLM(config)
 
@@ -188,7 +216,16 @@ def main():
 
     optimizer = HybridAdam(model.parameters())
     torch.set_default_dtype(torch.bfloat16)
-    model, optimizer, _, dataloader, _ = booster.boost(model, optimizer, dataloader=dataloader)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=args.num_steps,
+    )
+
+    model, optimizer, _criterion, dataloader, lr_scheduler = booster.boost(
+        model, optimizer, criterion=_criterion, dataloader=dataloader, lr_scheduler=lr_scheduler
+    )
+
     torch.set_default_dtype(torch.float)
     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated()/1024**2:.2f} MB")
     coordinator.print_on_master(
@@ -197,23 +234,54 @@ def main():
 
     if isinstance(plugin, HybridParallelPlugin) and args.pp > 1:
         data_iter = iter(dataloader)
-        for step in tqdm(range(len(dataloader)), desc="Step", disable=not coordinator.is_master()):
-            performance_evaluator.on_step_start(step)
-            booster.execute_pipeline(
-                data_iter, model, criterion=lambda outputs, inputs: outputs[0], optimizer=optimizer, return_loss=False
-            )
-            optimizer.step()
-            optimizer.zero_grad()
-            performance_evaluator.on_step_end(input_ids=torch.empty(args.batch_size, args.max_length))
+        is_pp_last_stage = booster.plugin.stage_manager.is_last_stage()
+        with tqdm(range(len(dataloader)), desc="Step", disable=not coordinator.is_master()) as pbar:
+            for step in pbar:
+                performance_evaluator.on_step_start(step)
+                outputs = booster.execute_pipeline(
+                    data_iter, model, criterion=_criterion, optimizer=optimizer, return_loss=True
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
+                performance_evaluator.on_step_end(input_ids=torch.empty(args.batch_size, args.max_length))
+
+                # tensorboard
+                if is_pp_last_stage:
+                    loss = outputs["loss"]
+                    pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+                    if coordinator.is_master():
+                        writer.add_scalar(tag="Loss", scalar_value=loss.item(), global_step=step)
+
     else:
-        for step, batch in enumerate(tqdm(dataloader, desc="Step", disable=not coordinator.is_master())):
-            performance_evaluator.on_step_start(step)
-            outputs = model(**batch)
-            loss = outputs[0]
-            booster.backward(loss, optimizer)
-            optimizer.step()
-            optimizer.zero_grad()
-            performance_evaluator.on_step_end(**batch)
+        with torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            with tqdm(
+                iterable=enumerate(dataloader),
+                desc="Step",
+                disable=not coordinator.is_master(),
+            ) as pbar:
+                for step, batch in pbar:
+                    prof.step()
+                    if step >= 2 + 3 + 5:
+                        break
+                    performance_evaluator.on_step_start(step)
+                    outputs = model(**batch)
+                    loss = outputs[0]
+                    booster.backward(loss, optimizer)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    performance_evaluator.on_step_end(**batch)
+                    # tensorboard
+                    all_reduce_mean(tensor=loss)
+                    pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+                    if coordinator.is_master():
+                        writer.add_scalar(tag="Loss", scalar_value=loss.item(), global_step=step)
 
     performance_evaluator.on_fit_end()
     coordinator.print_on_master(f"Max CUDA memory usage: {torch.cuda.max_memory_allocated()/1024**2:.2f} MB")

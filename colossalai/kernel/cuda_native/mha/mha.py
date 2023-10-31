@@ -47,6 +47,9 @@ class ColoAttention(torch.nn.Module):
         attn_mask_type: Optional[AttnMaskType] = None,
         bias: Optional[torch.Tensor] = None,
     ):
+        # torch.cuda.synchronize()
+        # start_time = time.time()
+
         attn = None
         if HAS_FLASH_ATTN and query.dtype in [torch.float16, torch.bfloat16] and bias == None:
             attn = flash_attention
@@ -72,7 +75,19 @@ class ColoAttention(torch.nn.Module):
 
             # bert style
             if tgt_len == src_len:
+                """
+                torch.cuda.synchronize()
+                start_time = time.time()
+                """
+
                 seq_len_info_q = SeqLenInfo.materialize(attn_mask=attn_mask, device=query.device)
+
+                """
+                torch.cuda.synchronize()
+                end_time = time.time()
+                print("***materialize time: ", end_time - start_time)
+                """
+
                 if batch_size > 1:
                     query, key, value = self.unpad(
                         torch.stack([query, key, value], dim=2), seq_len_info_q.indices
@@ -90,6 +105,10 @@ class ColoAttention(torch.nn.Module):
                     )
                 else:
                     query, key, value = torch.stack([query, key, value], dim=2).squeeze(0).unbind(dim=1)
+
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # print("***materialize time: ", end_time - start_time)
 
         out = attn(
             query,
@@ -110,4 +129,9 @@ class ColoAttention(torch.nn.Module):
             out = rearrange(out, "(b s) h d -> b s h d", b=batch_size)
 
         out = rearrange(out, "b s h d -> b s (h d)")
+
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # print("***colo attn time: ", end_time - start_time)
+
         return out
